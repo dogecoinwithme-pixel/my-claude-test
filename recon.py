@@ -51,6 +51,7 @@ Dependencies: standard library only, plus `requests` (optional but recommended).
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import random
 import re
@@ -62,6 +63,7 @@ import time
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 
 try:
     import requests  # nicer HTTP; optional
@@ -114,30 +116,69 @@ def banner(text: str) -> None:
     print("\n" + color(f"== {text} ==", "1;36"))
 
 
-def finding(check: str, severity: str, confidence: float, evidence: str, note: str, **extra) -> dict:
-    """Structured, evidence-based finding. severity: info/low/medium/high.
-    confidence: 0.0-1.0, how sure the heuristic is this is real and exploitable."""
-    f = {"check": check, "severity": severity, "confidence": round(confidence, 2), "evidence": evidence, "note": note}
+def finding(check: str, severity: str, confidence: float, evidence: str, note: str,
+            tier: str = "CANDIDATE", **extra) -> dict:
+    """Structured, evidence-based finding.
+
+    severity: info/low/medium/high - how bad it would be if real.
+    confidence: 0.0-1.0 - how sure the heuristic is.
+    tier: INFO / CANDIDATE / VERIFIED - the epistemic status of the *method*,
+        set explicitly per check rather than derived from confidence:
+          INFO      - hardening/observational, not a vulnerability by itself
+          CANDIDATE - a real signal that still needs manual confirmation
+                      (this blind tool cannot prove exploitability or
+                      ownership on its own for these classes)
+          VERIFIED  - the check directly observed proof (evaluated
+                      expression, exact metacharacter survival, matched
+                      file content, expired cert, etc.) - still not the
+                      same as a full PoC, but as conclusive as a blind
+                      scan gets.
+    """
+    f = {
+        "check": check, "severity": severity, "confidence": round(confidence, 2), "tier": tier,
+        "evidence": evidence, "note": note,
+    }
     f.update(extra)
     return f
+
+
+def severity_for_confidence(confidence: float) -> str:
+    if confidence >= 0.8:
+        return "high"
+    if confidence >= 0.5:
+        return "medium"
+    if confidence >= 0.25:
+        return "low"
+    return "info"
 
 
 def print_finding(f: dict) -> None:
     sev_color = {"info": "36", "low": "33", "medium": "33;1", "high": "31;1"}.get(f["severity"], "0")
     tag = f["severity"].upper()
+    tier = f.get("tier", "CANDIDATE")
     loc = f.get("url") or f.get("param") or f.get("cookie") or ""
-    print(color(f"  [{tag} conf={f['confidence']}]", sev_color) + f" {f['check']} {loc} - {f['note']}")
+    print(color(f"  [{tag} conf={f['confidence']} {tier}]", sev_color) + f" {f['check']} {loc} - {f['note']}")
 
 
 def normalize_target(raw: str) -> tuple[str, str]:
-    """Return (base_url, hostname) from user input in any common form."""
+    """Return (base_url, hostname) from user input in any common form.
+    Host is lowercased so later scope comparisons aren't case-sensitive."""
     raw = raw.strip()
     if not raw.startswith(("http://", "https://")):
         raw = "https://" + raw
     parsed = urllib.parse.urlparse(raw)
-    host = parsed.hostname or ""
+    host = (parsed.hostname or "").lower()
     base = f"{parsed.scheme}://{parsed.netloc}"
     return base, host
+
+
+def same_host(url: str, host: str) -> bool:
+    """Case-insensitive, port-agnostic host comparison. Using .netloc (which
+    can include a port) against a bare hostname was a real bug: a redirect
+    to the same host on a non-default port, e.g. https://example.com:8443/,
+    would be misjudged as leaving scope. Port is intentionally ignored -
+    scope is normally defined by hostname, not port."""
+    return (urllib.parse.urlparse(url).hostname or "").lower() == host.lower()
 
 
 def http_get(url: str, method: str = "GET", extra_headers: dict | None = None,
@@ -199,7 +240,7 @@ def fetch_in_scope(url: str, host: str, budget: "RequestBudget", extra_headers: 
         if status in (301, 302, 303, 307, 308) and headers.get("location"):
             location = urllib.parse.urljoin(current, headers["location"])
             chain.append(location)
-            if urllib.parse.urlparse(location).netloc != host:
+            if not same_host(location, host):
                 return status, headers, body, chain  # stop - do not leave scope
             current = location
             continue
@@ -246,19 +287,21 @@ def get_tls_info(host: str, port: int = 443) -> dict:
                     info["findings"].append(finding(
                         "tls-weak-protocol", "medium", 0.9, info["protocol"],
                         f"negotiated {info['protocol']} - deprecated protocol, should be disabled server-side",
+                        tier="VERIFIED",
                     ))
                 if info["issuer"] == info["subject"]:
                     info["findings"].append(finding(
                         "tls-self-signed", "low", 0.5, str(info["issuer"]),
                         "issuer == subject, looks self-signed (or this is an internal CA) - verify manually",
+                        tier="CANDIDATE",
                     ))
                 try:
                     expires = datetime.strptime(info["not_after"], "%b %d %H:%M:%S %Y %Z")
                     days_left = (expires - datetime.utcnow()).days
                     if days_left < 0:
-                        info["findings"].append(finding("tls-expired", "high", 0.95, info["not_after"], "certificate is expired"))
+                        info["findings"].append(finding("tls-expired", "high", 0.95, info["not_after"], "certificate is expired", tier="VERIFIED"))
                     elif days_left < 30:
-                        info["findings"].append(finding("tls-expiring-soon", "low", 0.8, info["not_after"], f"certificate expires in {days_left} days"))
+                        info["findings"].append(finding("tls-expiring-soon", "low", 0.8, info["not_after"], f"certificate expires in {days_left} days", tier="INFO"))
                 except (ValueError, TypeError):
                     pass
     except Exception as e:  # noqa: BLE001
@@ -345,9 +388,12 @@ def analyze_cookies(base: str, budget: "RequestBudget") -> list:
             issues.append("SameSite=None without Secure flag (rejected by modern browsers, but misconfigured)")
 
         if issues:
+            # These are hardening gaps, not proven vulnerabilities on their own -
+            # e.g. missing HttpOnly only matters in combination with an actual
+            # XSS elsewhere. Tier stays INFO regardless of severity label.
             severity = "medium" if "httponly" not in attr_names else "low"
             findings.append(finding(
-                "cookie-flags", severity, 1.0, raw, "; ".join(issues), cookie=name,
+                "cookie-flags", severity, 1.0, raw, "; ".join(issues), tier="INFO", cookie=name,
             ))
     return findings
 
@@ -385,7 +431,8 @@ def check_paths(base: str, budget: "RequestBudget") -> dict:
         if validator(body):
             findings.append(finding(
                 "sensitive-file-disclosure", "high", 0.9, body[:200].replace("\n", " "),
-                f"{path} returned 200 AND content matches expected sensitive-file structure", url=base + path,
+                f"{path} returned 200 AND content matches expected sensitive-file structure",
+                tier="VERIFIED", url=base + path,
             ))
         else:
             inventory.append({"path": path, "status": status, "note": "reachable but content did not match expected structure (likely a custom 200/soft-404 page) - low signal"})
@@ -407,6 +454,16 @@ SECRET_PATTERNS = [
     ("generic_api_key_assignment", re.compile(r"(?:api[_-]?key|secret|token)['\"]?\s*[:=]\s*['\"][A-Za-z0-9_\-]{16,64}['\"]", re.I), 0.35),
 ]
 
+# Patterns that LOOK like secrets but are meant to be public - excluded before
+# they can generate noise (e.g. Stripe publishable keys are, by design, safe
+# to ship in client-side JS; only sk_live_/rk_live_ secret keys matter).
+PUBLIC_KEY_EXCLUSIONS = [
+    re.compile(r"\bpk_(live|test)_[0-9a-zA-Z]{16,}\b"),   # Stripe PUBLISHABLE key
+    re.compile(r"\bG-[A-Z0-9]{6,10}\b"),                   # GA4 measurement ID
+    re.compile(r"\bUA-\d{4,10}-\d{1,2}\b"),                # Universal Analytics ID
+    re.compile(r"\b6L[0-9A-Za-z_-]{38}\b"),                # reCAPTCHA site key
+]
+
 
 def scan_secrets(label: str, body: str) -> list:
     findings = []
@@ -414,12 +471,67 @@ def scan_secrets(label: str, body: str) -> list:
         return findings
     for name, pattern, confidence in SECRET_PATTERNS:
         for m in pattern.finditer(body):
+            matched_text = m.group(0)
+            if any(excl.search(matched_text) for excl in PUBLIC_KEY_EXCLUSIONS):
+                continue
             snippet = body[max(0, m.start() - 20):m.end() + 10]
             findings.append(finding(
-                "secret-exposure", "high" if confidence >= 0.8 else "medium", confidence,
-                snippet.replace("\n", " "), f"pattern '{name}' matched in {label}", url=label,
+                "secret-exposure", severity_for_confidence(confidence), confidence,
+                snippet.replace("\n", " "), f"pattern '{name}' matched in {label}",
+                tier="VERIFIED" if confidence >= 0.8 else "CANDIDATE", url=label,
             ))
     return findings
+
+
+# --------------------------------------------------------------------------
+# Public-suffix-aware apex domain extraction
+# --------------------------------------------------------------------------
+
+# A naive "last two labels" heuristic is WRONG for multi-label public
+# suffixes: 'www.example.co.uk'.split('.')[-2:] gives 'co.uk', which would
+# scope subdomain/wayback enumeration to the ENTIRE .co.uk TLD - a
+# different organization's domains, not the target's. This is a curated
+# subset of the most common such suffixes as a fallback; tldextract (if
+# installed) uses the real, actively-maintained public suffix list and is
+# always preferred when available.
+_COMMON_MULTI_LABEL_SUFFIXES = {
+    "co.uk", "org.uk", "gov.uk", "ac.uk", "me.uk", "ltd.uk", "plc.uk", "net.uk",
+    "co.jp", "co.kr", "co.nz", "co.za", "co.in", "co.il", "co.id",
+    "com.au", "net.au", "org.au", "com.br", "com.cn", "com.mx", "com.sg",
+    "com.hk", "com.tw", "com.tr", "com.ar", "com.co", "com.pe",
+    "github.io", "gitlab.io", "herokuapp.com", "netlify.app", "vercel.app",
+    "web.app", "pages.dev", "s3.amazonaws.com", "cloudfront.net", "azurewebsites.net",
+    "firebaseapp.com", "appspot.com",
+}
+
+
+def get_apex_domain(host: str) -> tuple[str, str]:
+    """Returns (apex_domain, method). method is 'tldextract' when the real
+    public suffix list was available, 'ip-literal' when the host is an IP
+    address (domain-suffix splitting is meaningless there - naively taking
+    the last two dot-separated labels of 127.0.0.1 would produce '0.1'),
+    or 'heuristic' when falling back to the curated set above + naive
+    last-two-labels - callers should surface that distinction rather than
+    silently trusting the heuristic."""
+    import ipaddress
+    try:
+        ipaddress.ip_address(host)
+        return host, "ip-literal"
+    except ValueError:
+        pass
+    try:
+        import tldextract  # optional; not in stdlib
+        ext = tldextract.extract(host)
+        if ext.domain and ext.suffix:
+            return f"{ext.domain}.{ext.suffix}", "tldextract"
+    except ImportError:
+        pass
+    labels = host.lower().split(".")
+    if len(labels) >= 3 and ".".join(labels[-2:]) in _COMMON_MULTI_LABEL_SUFFIXES:
+        return ".".join(labels[-3:]), "heuristic"
+    if len(labels) >= 2:
+        return ".".join(labels[-2:]), "heuristic"
+    return host, "heuristic"
 
 
 # --------------------------------------------------------------------------
@@ -477,7 +589,7 @@ def extract_links(base: str, host: str, body: str) -> list:
     out = []
     for h in hrefs:
         u = urllib.parse.urljoin(base + "/", h)
-        if urllib.parse.urlparse(u).netloc == host and u.startswith(("http://", "https://")):
+        if same_host(u, host) and u.startswith(("http://", "https://")):
             out.append(u.split("#")[0])
     return sorted(set(out))
 
@@ -515,7 +627,7 @@ def extract_js_endpoints(base: str, host: str, body: str, budget: "RequestBudget
         if checked >= max_files:
             break
         js_url = urllib.parse.urljoin(base + "/", src)
-        if urllib.parse.urlparse(js_url).netloc != host:
+        if not same_host(js_url, host):
             continue  # third-party JS (analytics/CDNs) - not this target's attack surface
         status, _, js_body = http_get(js_url, budget=budget)
         checked += 1
@@ -572,23 +684,122 @@ def _rand_token(n: int = 8) -> str:
     return "".join(random.choices(string.ascii_lowercase + string.digits, k=n))
 
 
-def _classify_reflection(body: str, marker: str) -> tuple[str, bool]:
-    """Returns (context, looks_unescaped). looks_unescaped is True only if the
-    marker appears adjacent to raw <, ", or ' - i.e. it could break out of an
-    attribute/tag - not just present as inert text."""
+REFLECTION_METACHARS = "\"'><"  # the actual breakout characters we test survival of, not just an alnum marker
+
+
+class _ReflectionContextParser(HTMLParser):
+    """Walks the response HTML once (real parser, not sliding-window regex)
+    and records the DOM location(s) our marker landed in: a tag attribute
+    value, raw text, <script>/<style> content, or a comment. Best-effort -
+    stdlib html.parser can diverge from a browser's HTML5 parser on
+    malformed markup, so this narrows down context, it doesn't replace
+    manual confirmation with a real browser."""
+
+    def __init__(self, marker: str):
+        super().__init__(convert_charrefs=True)
+        self.marker = marker
+        self.contexts: list = []
+        self._in_script = False
+        self._in_style = False
+
+    def handle_starttag(self, tag, attrs):
+        t = tag.lower()
+        if t == "script":
+            self._in_script = True
+        elif t == "style":
+            self._in_style = True
+        for name, value in attrs:
+            if value and self.marker in value:
+                self.contexts.append(("html-attribute", f"{tag}[{name}]"))
+
+    def handle_endtag(self, tag):
+        t = tag.lower()
+        if t == "script":
+            self._in_script = False
+        elif t == "style":
+            self._in_style = False
+
+    def handle_data(self, data):
+        if self.marker not in data:
+            return
+        if self._in_script:
+            self.contexts.append(("script-block", "script"))
+        elif self._in_style:
+            self.contexts.append(("style-block", "style"))
+        else:
+            self.contexts.append(("html-text", "text"))
+
+    def handle_comment(self, data):
+        if self.marker in data:
+            self.contexts.append(("html-comment", "comment"))
+
+
+def _survival_state(body: str, marker: str) -> str:
+    """Checks whether the EXACT metacharacters we injected (\"'><) survived
+    unescaped immediately before the marker - direct proof of breakout
+    capability, not an inference from unrelated markup elsewhere on the
+    page. This is the actual fix for 'reflection without executable-context
+    proof': the payload now carries real metacharacters, and we check
+    whether THOSE specific characters came back raw."""
     idx = body.find(marker)
     if idx == -1:
-        return "not-found", False
-    window = body[max(0, idx - 30):idx + len(marker) + 10]
-    unescaped = bool(re.search(r'[<"\']' + re.escape(marker), window)) or bool(re.search(re.escape(marker) + r'[<>"\']', window))
-    before_tag = body[max(0, idx - 200):idx]
-    if re.search(r"<script\b[^>]*>[^<]*$", before_tag, re.I):
-        context = "script-block"
-    elif re.search(r'=["\']?[^"\'>]*$', before_tag):
-        context = "html-attribute"
-    else:
-        context = "html-body"
-    return context, unescaped
+        return "not-found"
+    before = body[max(0, idx - len(REFLECTION_METACHARS)):idx]
+    if before.endswith(REFLECTION_METACHARS):
+        return "unescaped"
+    encoded_forms = ["&quot;&#39;&gt;&lt;", "&#34;&#39;&gt;&lt;", "%22%27%3E%3C"]
+    if any(before.endswith(ef) for ef in encoded_forms):
+        return "encoded"
+    if any(c in before for c in REFLECTION_METACHARS):
+        return "partial"  # some but not all metacharacters survived - a filter is doing SOMETHING, may be bypassable
+    return "stripped"
+
+
+def _classify_reflection(body: str, marker: str) -> tuple[str, str]:
+    """Returns (dom_context, survival_state)."""
+    survival = _survival_state(body, marker)
+    parser = _ReflectionContextParser(marker)
+    try:
+        parser.feed(body)
+    except Exception:  # noqa: BLE001
+        pass
+    context = parser.contexts[0][0] if parser.contexts else "unknown"
+    return context, survival
+
+
+def _reflection_probe() -> tuple[str, str]:
+    marker = f"rXf{_rand_token(6)}"
+    payload = f"{REFLECTION_METACHARS}{marker}"
+    return marker, payload
+
+
+def _reflection_finding(param: str, url: str, status: int | None, body: str, marker: str) -> dict | None:
+    """Shared scoring logic for both the synthetic and discovered-URL
+    reflection tests, so the tier/confidence policy lives in exactly one
+    place. Only 'unescaped' (proven metachar survival) reaches VERIFIED;
+    everything else is explicitly weaker signal."""
+    if not body or marker not in body:
+        return None
+    context, survival = _classify_reflection(body, marker)
+    idx = body.find(marker)
+    snippet = body[max(0, idx - 40):idx + 40].replace("\n", " ")
+
+    if survival == "unescaped":
+        confidence, severity, tier = 0.85, "high", "VERIFIED"
+        context_note = context if context != "unknown" else "a context the parser couldn't cleanly resolve (often because the injected markup itself broke normal tag structure - consistent with a real breakout)"
+        note = (f"param='{param}' reflected with the exact injected metacharacters (\"'><) unescaped immediately "
+                f"before it, in {context_note} - real breakout proof; a WAF/CSP could still block actual exploitation, confirm manually")
+    elif survival == "partial":
+        confidence, severity, tier = 0.5, "medium", "CANDIDATE"
+        note = f"param='{param}' reflected in {context} with SOME injected metacharacters surviving unescaped - partial filter, worth manual bypass attempts"
+    elif survival == "encoded":
+        confidence, severity, tier = 0.15, "info", "INFO"
+        note = f"param='{param}' reflected in {context} but metacharacters were HTML/URL-encoded - looks properly escaped"
+    else:  # stripped
+        confidence, severity, tier = 0.2, "info", "INFO"
+        note = f"param='{param}' marker text reflected in {context} but injected metacharacters were stripped - low exploitability signal"
+
+    return finding("reflected-input", severity, confidence, snippet, note, tier=tier, param=param, url=url, status=status)
 
 
 def test_reflection_isolated(base: str, param_names: list, budget: "RequestBudget") -> list:
@@ -597,35 +808,29 @@ def test_reflection_isolated(base: str, param_names: list, budget: "RequestBudge
     submit via JS)."""
     findings = []
     for param in param_names:
-        marker = f"rXf{_rand_token(6)}"
-        base_status, _, base_body = http_get(f"{base}/?{param}=baseline{_rand_token(4)}", budget=budget)
-        status, _, body = http_get(f"{base}/?{param}={urllib.parse.quote(marker)}", budget=budget)
-        if not body or marker not in body:
-            continue
+        marker, payload = _reflection_probe()
+        _, _, base_body = http_get(f"{base}/?{param}=baseline{_rand_token(4)}", budget=budget)
+        status, _, body = http_get(f"{base}/?{param}={urllib.parse.quote(payload)}", budget=budget)
         if base_body and marker in base_body:
-            continue  # reflected even in unrelated baseline - not caused by our input
-        context, unescaped = _classify_reflection(body, marker)
-        confidence = 0.75 if unescaped and context in ("html-attribute", "script-block", "html-body") else 0.3
-        findings.append(finding(
-            "reflected-input", "medium" if confidence >= 0.6 else "low", confidence,
-            body[max(0, body.find(marker) - 40):body.find(marker) + 40].replace("\n", " "),
-            f"param='{param}' reflected {'unescaped' if unescaped else 'as encoded/inert text'} in {context} - verify manually before reporting",
-            param=param, url=f"{base}/?{param}=...", status=status,
-        ))
+            continue  # reflected even in an unrelated baseline - not caused by our input
+        f = _reflection_finding(param, f"{base}/?{param}=...", status, body, marker)
+        if f:
+            findings.append(f)
     return findings
 
 
-def _param_variants(url: str, marker: str) -> list:
+def _param_variants(url: str, replacement: str) -> list:
     """For a URL with existing query params, yield (param_name, variant_url)
-    pairs where exactly ONE parameter is replaced with the marker and all
-    others keep their original values - this is the fix for the
-    all-params-get-the-same-value bug."""
+    pairs where exactly ONE parameter is replaced and all others keep their
+    original values - this is the fix for the all-params-get-the-same-value
+    bug: ?id=X&name=alice&sort=date now tests id alone, then name alone,
+    then sort alone, instead of replacing all three at once."""
     parsed = urllib.parse.urlparse(url)
     qs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
     out = []
     for i, (k, _v) in enumerate(qs):
         new_qs = list(qs)
-        new_qs[i] = (k, marker)
+        new_qs[i] = (k, replacement)
         variant = parsed._replace(query=urllib.parse.urlencode(new_qs)).geturl()
         out.append((k, variant))
     return out
@@ -633,15 +838,13 @@ def _param_variants(url: str, marker: str) -> list:
 
 def test_reflection_on_urls(urls: list, host: str, budget: "RequestBudget", max_urls: int = 15, max_params: int = 6) -> list:
     """Real per-parameter isolated testing on actually-discovered URLs with
-    multiple query params, exactly like: ?id=X&name=alice&sort=date ->
-    test id alone, then name alone, then sort alone, each against its own
-    unmodified baseline."""
+    multiple query params, against each URL's own unmodified baseline."""
     findings = []
     tested_urls = 0
     for url in urls:
         if tested_urls >= max_urls:
             break
-        if urllib.parse.urlparse(url).netloc != host:
+        if not same_host(url, host):
             continue
         variants = _param_variants(url, "placeholder")
         if not variants:
@@ -649,27 +852,16 @@ def test_reflection_on_urls(urls: list, host: str, budget: "RequestBudget", max_
         tested_urls += 1
         _, _, baseline_body = http_get(url, budget=budget)
         for param, _variant in variants[:max_params]:
-            marker = f"rXf{_rand_token(6)}"
-            variant_url = None
-            for p2, v2 in _param_variants(url, marker):
-                if p2 == param:
-                    variant_url = v2
-                    break
+            marker, payload = _reflection_probe()
+            variant_url = next((v for p2, v in _param_variants(url, payload) if p2 == param), None)
             if not variant_url:
                 continue
             status, _, body = http_get(variant_url, budget=budget)
-            if not body or marker not in body:
-                continue
             if baseline_body and marker in baseline_body:
                 continue
-            context, unescaped = _classify_reflection(body, marker)
-            confidence = 0.8 if unescaped and context in ("html-attribute", "script-block") else (0.55 if unescaped else 0.25)
-            findings.append(finding(
-                "reflected-input", "medium" if confidence >= 0.6 else "low", confidence,
-                body[max(0, body.find(marker) - 40):body.find(marker) + 40].replace("\n", " "),
-                f"param='{param}' isolated-tested on discovered URL, reflected {'unescaped' if unescaped else 'as encoded/inert text'} in {context}",
-                param=param, url=url, status=status,
-            ))
+            f = _reflection_finding(param, url, status, body, marker)
+            if f:
+                findings.append(f)
     return findings
 
 
@@ -684,7 +876,8 @@ def check_open_redirect(base: str, budget: "RequestBudget") -> list:
             if location.startswith(canary) or "example.com" in location:
                 findings.append(finding(
                     "open-redirect", "medium", 0.8, f"{status} -> {location}",
-                    f"param='{param}' redirects to attacker-supplied external URL", param=param, url=url,
+                    f"param='{param}' redirects to attacker-supplied external URL - directly observed, about as conclusive as a blind check gets",
+                    tier="VERIFIED", param=param, url=url,
                 ))
     return findings
 
@@ -704,11 +897,13 @@ def check_cors_misconfig(base: str, budget: "RequestBudget") -> list:
             findings.append(finding(
                 "cors-misconfig", "high", 0.85, f"Origin: {probe_origin} -> ACAO: {acao}, ACAC: {acac}",
                 "reflects arbitrary Origin AND allows credentials - confirm with a real cross-origin fetch() PoC before reporting as data exposure",
+                tier="CANDIDATE",
             ))
         elif acao == "*" and acac == "true":
             findings.append(finding(
                 "cors-misconfig", "info", 0.3, f"ACAO: *, ACAC: {acac}",
                 "ACAO=* with ACAC=true is invalid per spec and browsers reject it - usually not exploitable, informational only",
+                tier="INFO",
             ))
     return findings
 
@@ -719,14 +914,20 @@ def check_cors_misconfig(base: str, budget: "RequestBudget") -> list:
 # --------------------------------------------------------------------------
 
 def check_csrf_indicators(forms: list) -> list:
+    """Absence of a visible token field is weak signal by design: modern
+    frameworks very commonly protect state-changing requests via
+    SameSite=Strict/Lax cookies or a custom header token set by JS, neither
+    of which appears anywhere in the HTML this parses. Stays INFO tier and
+    low confidence so it doesn't read as a confirmed gap."""
     findings = []
     for f in forms:
         if f["method"] in ("POST", "PUT", "PATCH", "DELETE") and not f["has_csrf_token_field"]:
             findings.append(finding(
-                "csrf-indicator", "low", 0.4, json.dumps(f),
+                "csrf-indicator", "low", 0.3, json.dumps(f),
                 f"state-changing form (method={f['method']}) on {f.get('page','?')} has no visible CSRF token input - "
-                "may still be protected by SameSite cookies or a header-based token invisible to HTML parsing; verify manually",
-                url=f.get("page", ""),
+                "very common with SameSite-cookie or header-token protection patterns invisible to HTML parsing; "
+                "weak signal on its own, verify manually",
+                tier="INFO", url=f.get("page", ""),
             ))
     return findings
 
@@ -772,37 +973,75 @@ TRAVERSAL_PAYLOADS = {
     "..\\" * 6 + "windows\\win.ini": re.compile(r"\[fonts\]", re.I),
 }
 
-TIMING_THRESHOLD = 4.0  # seconds over baseline before a delay counts as signal
+TIMING_THRESHOLD = 4.0  # minimum absolute seconds over baseline before a delay is even considered
+
+
+def _timed_get(url: str, budget: "RequestBudget") -> tuple[int | None, str, float]:
+    t0 = time.monotonic()
+    status, _, body = http_get(url, budget=budget)
+    return status, body, time.monotonic() - t0
+
+
+def _baseline_timing(url: str, budget: "RequestBudget", samples: int = 2) -> tuple[float, float, str]:
+    """Multiple baseline samples so a single slow request can't be mistaken
+    for injection-induced delay - returns (mean, stdev, last_body)."""
+    elapseds, last_body = [], ""
+    for _ in range(samples):
+        _, body, e = _timed_get(url, budget)
+        elapseds.append(e)
+        last_body = body
+    mean = sum(elapseds) / len(elapseds)
+    stdev = (sum((e - mean) ** 2 for e in elapseds) / len(elapseds)) ** 0.5 if len(elapseds) > 1 else 0.0
+    return mean, stdev, last_body
+
+
+def _confirmed_timing_signal(test_url: str, budget: "RequestBudget", baseline_mean: float, baseline_stdev: float,
+                              threshold: float = TIMING_THRESHOLD) -> dict | None:
+    """Requires the delay to clear BOTH an absolute threshold and a
+    variance-aware margin (3 standard deviations over the observed
+    baseline), then requires it to reproduce on a second, independent
+    request before calling it a signal at all. A single-sample timing
+    check is exactly what generates false positives from ordinary network
+    jitter, GC pauses, or a momentarily busy server - this doesn't
+    eliminate that risk, but it substantially narrows it."""
+    margin = max(threshold, 3 * baseline_stdev)
+    status1, _, elapsed1 = _timed_get(test_url, budget)
+    if status1 is None or (elapsed1 - baseline_mean) < margin:
+        return None
+    status2, _, elapsed2 = _timed_get(test_url, budget)
+    if status2 is None or (elapsed2 - baseline_mean) < margin * 0.7:
+        return None  # didn't reproduce - treat as a one-off blip, not a real signal
+    return {
+        "baseline_mean_s": round(baseline_mean, 2), "baseline_stdev_s": round(baseline_stdev, 3),
+        "trial1_s": round(elapsed1, 2), "trial2_s": round(elapsed2, 2), "margin_required_s": round(margin, 2),
+    }
 
 
 def check_sqli_indicators(base: str, param_names: list, budget: "RequestBudget") -> list:
     findings = []
     for param in param_names:
-        t0 = time.monotonic()
-        _, _, base_body = http_get(f"{base}/?{param}=1", budget=budget)
-        baseline_elapsed = time.monotonic() - t0
+        baseline_mean, baseline_stdev, baseline_body = _baseline_timing(f"{base}/?{param}=1", budget)
 
         _, _, err_body = http_get(f"{base}/?{param}={urllib.parse.quote(chr(39))}", budget=budget)
         for sig in SQL_ERROR_SIGNATURES:
-            if err_body and sig.search(err_body) and not (base_body and sig.search(base_body)):
+            if err_body and sig.search(err_body) and not (baseline_body and sig.search(baseline_body)):
                 findings.append(finding(
                     "sqli-indicator", "high", 0.75, sig.pattern,
                     f"param='{param}' single-quote probe surfaced a SQL error signature absent from baseline - "
                     "error-based SQLi indicator, confirm manually before further testing",
-                    param=param,
+                    tier="CANDIDATE", param=param,
                 ))
                 break
 
         for dialect, payload in SQL_TIME_PAYLOADS.items():
-            t0 = time.monotonic()
-            status, _, _ = http_get(f"{base}/?{param}={urllib.parse.quote(payload)}", budget=budget)
-            elapsed = time.monotonic() - t0
-            if status is not None and elapsed - baseline_elapsed > TIMING_THRESHOLD:
+            evidence = _confirmed_timing_signal(f"{base}/?{param}={urllib.parse.quote(payload)}", budget, baseline_mean, baseline_stdev)
+            if evidence:
                 findings.append(finding(
-                    "sqli-indicator", "high", 0.6, f"baseline={baseline_elapsed:.2f}s test={elapsed:.2f}s dialect={dialect}",
-                    f"param='{param}' time-based probe ({dialect}) added ~5s vs baseline - blind SQLi indicator; "
-                    "re-test once before reporting to rule out network jitter",
-                    param=param,
+                    "sqli-indicator", "high", 0.65, json.dumps(evidence),
+                    f"param='{param}' time-based probe ({dialect}) reproduced a delay of {evidence['margin_required_s']}s+ over a "
+                    f"{2}-sample baseline (mean={evidence['baseline_mean_s']}s, stdev={evidence['baseline_stdev_s']}s) "
+                    "on two independent trials - blind SQLi indicator",
+                    tier="CANDIDATE", param=param,
                 ))
                 break
     return findings
@@ -815,10 +1054,10 @@ def check_ssti_indicators(base: str, param_names: list, budget: "RequestBudget")
             status, _, body = http_get(f"{base}/?{param}={urllib.parse.quote(payload)}", budget=budget)
             if body and expected in body and payload not in body:
                 findings.append(finding(
-                    "ssti-indicator", "high", 0.7, f"payload={payload} -> response contains '{expected}'",
+                    "ssti-indicator", "high", 0.75, f"payload={payload} -> response contains '{expected}'",
                     f"param='{param}' template expression was evaluated server-side rather than reflected literally - "
-                    "SSTI indicator, confirm manually",
-                    param=param,
+                    "direct proof of template evaluation, about as conclusive as a blind scan gets; confirm impact manually",
+                    tier="VERIFIED", param=param,
                 ))
                 break
     return findings
@@ -827,20 +1066,15 @@ def check_ssti_indicators(base: str, param_names: list, budget: "RequestBudget")
 def check_command_injection_indicators(base: str, param_names: list, budget: "RequestBudget") -> list:
     findings = []
     for param in param_names:
-        t0 = time.monotonic()
-        http_get(f"{base}/?{param}=1", budget=budget)
-        baseline_elapsed = time.monotonic() - t0
+        baseline_mean, baseline_stdev, _ = _baseline_timing(f"{base}/?{param}=1", budget)
         for payload in CMDI_TIME_PAYLOADS:
-            t0 = time.monotonic()
-            status, _, _ = http_get(f"{base}/?{param}={urllib.parse.quote(payload)}", budget=budget)
-            elapsed = time.monotonic() - t0
-            if status is not None and elapsed - baseline_elapsed > TIMING_THRESHOLD:
+            evidence = _confirmed_timing_signal(f"{base}/?{param}={urllib.parse.quote(payload)}", budget, baseline_mean, baseline_stdev)
+            if evidence:
                 findings.append(finding(
-                    "command-injection-indicator", "high", 0.55,
-                    f"baseline={baseline_elapsed:.2f}s test={elapsed:.2f}s payload={payload!r}",
-                    f"param='{param}' shell-metacharacter timing probe added ~5s vs baseline - blind OS command "
-                    "injection indicator; re-test once before reporting to rule out jitter",
-                    param=param,
+                    "command-injection-indicator", "high", 0.6, json.dumps(evidence),
+                    f"param='{param}' shell-metacharacter timing probe ({payload!r}) reproduced a delay over baseline "
+                    "on two independent trials - blind OS command injection indicator",
+                    tier="CANDIDATE", param=param,
                 ))
                 break
     return findings
@@ -853,22 +1087,27 @@ def check_path_traversal_indicators(base: str, budget: "RequestBudget") -> list:
         status, _, body = http_get(url, budget=budget)
         if status == 200 and body and signature.search(body):
             findings.append(finding(
-                "path-traversal-indicator", "high", 0.7, body[:150].replace("\n", " "),
+                "path-traversal-indicator", "high", 0.75, body[:150].replace("\n", " "),
                 "traversal payload returned a recognizable system-file signature - confirm manually, "
                 "do not pull further files with this tool",
-                url=url,
+                tier="VERIFIED", url=url,
             ))
     return findings
 
 
 GRAPHQL_INTROSPECTION_QUERY = {"query": "{__schema{queryType{name}mutationType{name}types{name kind}}}"}
 GRAPHQL_CANDIDATE_PATHS = ["/graphql", "/api/graphql", "/graphql/console", "/v1/graphql"]
+GRAPHQL_SENSITIVE_KEYWORDS = ("password", "secret", "ssn", "creditcard", "credit_card", "apikey", "api_key", "privatekey")
 
 
 def check_graphql_introspection(base: str, budget: "RequestBudget") -> list:
     """Read-only: sends the standard introspection query and checks whether
-    the schema is exposed. Does not attempt authorization bypass on
-    resolvers - that needs field-by-field manual review of the schema."""
+    the schema is exposed. Introspection being enabled is extremely common
+    and often deliberate (many public APIs ship it on purpose), so on its
+    own this is INFO, not a vulnerability - it only escalates to CANDIDATE
+    if the returned type/field names themselves look sensitive. Does not
+    attempt authorization bypass on resolvers - that needs field-by-field
+    manual review of the schema."""
     findings = []
     for path in GRAPHQL_CANDIDATE_PATHS:
         status, headers, body = http_get(
@@ -876,12 +1115,21 @@ def check_graphql_introspection(base: str, budget: "RequestBudget") -> list:
             extra_headers={"Content-Type": "application/json"}, json_body=GRAPHQL_INTROSPECTION_QUERY,
         )
         if status == 200 and body and '"__schema"' in body and '"types"' in body:
-            findings.append(finding(
-                "graphql-introspection-enabled", "medium", 0.85, body[:150].replace("\n", " "),
-                f"{path} accepted a standard introspection query and returned the schema - "
-                "review exposed types/mutations for sensitive fields or unauthenticated write access",
-                url=base + path,
-            ))
+            hits = sorted({kw for kw in GRAPHQL_SENSITIVE_KEYWORDS if kw in body.lower()})
+            if hits:
+                findings.append(finding(
+                    "graphql-introspection-enabled", "medium", 0.5, f"sensitive-looking names in schema: {hits}",
+                    f"{path} exposes its schema via introspection AND contains sensitive-looking type/field names "
+                    f"({', '.join(hits)}) - review those specifically for unauthenticated access",
+                    tier="CANDIDATE", url=base + path,
+                ))
+            else:
+                findings.append(finding(
+                    "graphql-introspection-enabled", "info", 0.3, body[:150].replace("\n", " "),
+                    f"{path} accepted a standard introspection query - common and often intentional on public APIs; "
+                    "review the schema manually if this endpoint is expected to be private",
+                    tier="INFO", url=base + path,
+                ))
     return findings
 
 
@@ -893,9 +1141,11 @@ def _b64url_decode(segment: str) -> bytes:
 
 def inspect_jwts(label: str, body: str) -> list:
     """Passive: decodes any JWT-shaped token found in a response body and
-    flags structurally risky claims. Does not forge or resend tokens - that
-    would need to know which endpoint actually treats the token as an
-    authorization decision, which a blind scan can't determine safely."""
+    flags structurally risky claims as SEPARATE findings, each scored on its
+    own merit rather than bundled into one blanket 'jwt-structural-risk'.
+    Does not forge or resend tokens - that would need to know which
+    endpoint actually treats the token as an authorization decision, which
+    a blind scan can't determine safely."""
     findings = []
     if not body:
         return findings
@@ -906,19 +1156,30 @@ def inspect_jwts(label: str, body: str) -> list:
             payload = json.loads(_b64url_decode(token.split(".")[1]))
         except Exception:  # noqa: BLE001
             continue
-        issues = []
+
         if str(header.get("alg", "")).lower() == "none":
-            issues.append("header alg='none' - server-side acceptance would be a full auth bypass")
+            findings.append(finding(
+                "jwt-alg-none", "high", 0.6, f"header={header}",
+                "observed token's header has alg='none' - if the server accepts this unmodified it's a full auth "
+                "bypass; confirm by resending a copy with the signature stripped, using YOUR OWN session token",
+                tier="CANDIDATE", url=label,
+            ))
         if "exp" not in payload:
-            issues.append("no 'exp' claim - token may never expire")
+            findings.append(finding(
+                "jwt-no-exp", "info", 0.2, f"payload_keys={list(payload.keys())}",
+                "token has no 'exp' claim - may be a deliberately long-lived non-session token (e.g. an API key "
+                "formatted as a JWT); only relevant if this specific token is actually used for session auth",
+                tier="INFO", url=label,
+            ))
         if header.get("alg") in ("HS256", "HS384", "HS512") and any(
             k in str(payload).lower() for k in ("admin", "role", "is_admin", "scope")
         ):
-            issues.append("symmetric alg (HS*) carrying privilege claims - worth testing for a weak/guessable signing secret offline (e.g. with hashcat), not attempted here")
-        if issues:
             findings.append(finding(
-                "jwt-structural-risk", "medium", 0.5, f"header={header} payload_keys={list(payload.keys())}",
-                "; ".join(issues), url=label,
+                "jwt-symmetric-alg-privilege-claims", "info", 0.2,
+                f"alg={header.get('alg')} payload_keys={list(payload.keys())}",
+                "symmetric alg (HS*) token carries privilege-looking claims - worth an OFFLINE weak-secret check "
+                "(e.g. hashcat against a wordlist) using your own captured token; not attempted here",
+                tier="INFO", url=label,
             ))
     return findings
 
@@ -959,36 +1220,73 @@ def find_id_like_urls(urls: list, host: str) -> list:
     numeric query value - candidates for object-ID substitution testing."""
     out = []
     for u in urls:
-        if urllib.parse.urlparse(u).netloc != host:
+        if not same_host(u, host):
             continue
         if re.search(r"/\d{2,}(?:/|$)", u) or re.search(r"[?&]\w*id\w*=\d+", u, re.I):
             out.append(u)
     return sorted(set(out))
 
 
+def _content_similarity(a: str, b: str) -> float:
+    """Real structural similarity (difflib ratio on whitespace-normalized
+    text) instead of a crude length-ratio - two completely different user
+    profile pages can easily land within 15% of each other's byte length by
+    coincidence, which was the old check's actual failure mode."""
+    if not a or not b:
+        return 0.0
+    a_n = re.sub(r"\s+", " ", a)[:20000]
+    b_n = re.sub(r"\s+", " ", b)[:20000]
+    return difflib.SequenceMatcher(None, a_n, b_n, autojunk=True).quick_ratio()
+
+
 def test_idor_candidates(urls: list, host: str, cookie_a: str, cookie_b: str, budget: "RequestBudget", max_urls: int = 20) -> list:
-    """For each ID-like URL, fetch as account A and account B (two sessions
-    the tester owns). If BOTH accounts get an identical-shaped 2xx response
-    to a resource presumably scoped to one account, that's a horizontal
-    access-control candidate worth manual confirmation - this cannot itself
-    prove the object belongs to a different user, only that access wasn't
-    differentiated by session."""
+    """For each ID-like URL: fetch it anonymously, as account A, and as
+    account B (two sessions the tester owns).
+
+    The old version just checked whether both accounts got a similarly-sized
+    2xx response - which is nearly meaningless on its own, since a genuinely
+    public/shared resource (docs, static assets, a public listing) would
+    trivially "pass" that check too, without anything being an access-
+    control bug. This version requires:
+      1. the anonymous response to differ meaningfully from the authenticated
+         one (proves the resource is actually access-gated, not public)
+      2. a real content-similarity metric (difflib, not length-ratio) between
+         account A's and account B's responses
+      3. a minimum content size, so two near-empty/error pages can't
+         trivially "match"
+
+    It still cannot prove the object belongs to a different owner - only
+    that access wasn't differentiated by session - so this stays CANDIDATE
+    tier and capped confidence regardless of how similar the responses are.
+    """
     findings = []
     candidates = find_id_like_urls(urls, host)[:max_urls]
     for url in candidates:
+        anon_status, _, anon_body = http_get(url, budget=budget)
         status_a, _, body_a = http_get(url, budget=budget, extra_headers={"Cookie": cookie_a})
         status_b, _, body_b = http_get(url, budget=budget, extra_headers={"Cookie": cookie_b})
-        if status_a and status_b and status_a < 300 and status_b < 300:
-            len_a, len_b = len(body_a or ""), len(body_b or "")
-            similar_length = len_a and len_b and abs(len_a - len_b) / max(len_a, len_b) < 0.15
-            if similar_length:
-                findings.append(finding(
-                    "idor-candidate", "high", 0.55,
-                    f"account A: {status_a} ({len_a}b), account B: {status_b} ({len_b}b)",
-                    "both sessions received a similarly-shaped 2xx response for the same object URL - "
-                    "manually confirm the object actually belongs to a different account before reporting",
-                    url=url,
-                ))
+
+        if not (status_a and status_b and status_a < 300 and status_b < 300):
+            continue
+        if len(body_a or "") < 80 or len(body_b or "") < 80:
+            continue  # too small to meaningfully compare - avoids matching on trivial/empty pages
+
+        anon_differs = anon_status is None or anon_status >= 400 or _content_similarity(anon_body or "", body_a) < 0.6
+        if not anon_differs:
+            continue  # anonymous access looks just as successful - likely a public resource, not user-scoped
+
+        similarity = _content_similarity(body_a, body_b)
+        if similarity >= 0.85:
+            confidence = min(0.5, 0.2 + similarity * 0.3)
+            findings.append(finding(
+                "idor-candidate", "high", confidence,
+                f"anon={anon_status}, account A={status_a} ({len(body_a)}b), account B={status_b} ({len(body_b)}b), "
+                f"A/B content similarity={similarity:.2f}",
+                "resource looks access-gated (anonymous request failed/differed) but both authenticated sessions "
+                "received near-identical content for the same object URL - manually confirm the object actually "
+                "belongs to a different account before reporting; this cannot prove ownership on its own",
+                tier="CANDIDATE", url=url,
+            ))
     return findings
 
 
@@ -1001,7 +1299,7 @@ def run(target: str, active: bool = False, collaborator_domain: str | None = Non
         cookie_a: str | None = None, cookie_b: str | None = None,
         max_requests: int = 400) -> dict:
     base, host = normalize_target(target)
-    apex = ".".join(host.split(".")[-2:]) if host.count(".") >= 1 else host
+    apex, apex_method = get_apex_domain(host)
     budget = RequestBudget(max_requests=max_requests)
 
     report = {
@@ -1030,7 +1328,7 @@ def run(target: str, active: bool = False, collaborator_domain: str | None = Non
     print(f"  Status: {status}")
     if redirect_chain:
         print(f"  Redirect chain: {' -> '.join(redirect_chain)}")
-        if urllib.parse.urlparse(redirect_chain[-1]).netloc != host:
+        if not same_host(redirect_chain[-1], host):
             print(color(f"  [info] final hop leaves authorized host ({host}) - not followed further", "33"))
     header_analysis = analyze_headers(headers)
     report["inventory"]["technologies"] = header_analysis["technologies"]
@@ -1066,7 +1364,16 @@ def run(target: str, active: bool = False, collaborator_domain: str | None = Non
     add(scan_secrets(base, homepage_body))
 
     banner("Passive subdomains (crt.sh)")
-    report["inventory"]["subdomains"] = crtsh_subdomains(apex, budget)
+    if apex_method == "ip-literal":
+        print(color(f"  [info] target host is an IP literal ({host}) - domain-based subdomain/wayback "
+                     "enumeration doesn't apply, skipping.", "36"))
+        report["inventory"]["subdomains"] = {"count": 0, "subdomains": [], "error": "skipped: IP-literal target"}
+    else:
+        print(f"  Apex domain for enumeration: {apex}  (method: {apex_method})")
+        if apex_method == "heuristic":
+            print(color("  [info] no tldextract installed - using a curated fallback list for multi-label TLDs "
+                         "(.co.uk, .com.au, etc). Run `pip install tldextract` for full public-suffix accuracy.", "36"))
+        report["inventory"]["subdomains"] = crtsh_subdomains(apex, budget)
     sd = report["inventory"]["subdomains"]
     if sd["error"]:
         print(color(f"  {sd['error']}", "33"))
@@ -1078,7 +1385,11 @@ def run(target: str, active: bool = False, collaborator_domain: str | None = Non
     wayback_urls = []
     if wayback:
         banner("Historical URLs (Wayback, passive)")
-        wb = get_wayback_urls(apex, budget)
+        if apex_method == "ip-literal":
+            print(color("  [info] IP-literal target, skipping Wayback lookup.", "36"))
+            wb = {"count": 0, "urls": [], "error": "skipped: IP-literal target"}
+        else:
+            wb = get_wayback_urls(apex, budget)
         report["inventory"]["wayback"] = wb
         wayback_urls = wb["urls"]
         if wb["error"]:
@@ -1122,7 +1433,10 @@ def run(target: str, active: bool = False, collaborator_domain: str | None = Non
         add(test_reflection_on_urls(param_urls, host, budget))
 
         discovered_params = sorted({k for u in param_urls for k in urllib.parse.parse_qs(urllib.parse.urlparse(u).query)})
-        injection_param_set = sorted(set(INJECTABLE_PARAMS_DEFAULT + discovered_params))[:10]
+        # capped tighter than before: the statistically-confirmed timing probes (SQLi/cmdi) now take
+        # 2 baseline + up to 4 confirmation requests per param per dialect/payload, so this list directly
+        # multiplies request cost - keep it modest by default and raise --max-requests for full coverage.
+        injection_param_set = sorted(set(INJECTABLE_PARAMS_DEFAULT + discovered_params))[:8]
 
         banner(f"SQL injection indicators ({len(injection_param_set)} params, single-shot per dialect)")
         add(check_sqli_indicators(base, injection_param_set, budget))
